@@ -16,10 +16,10 @@ from typing import Any, Callable
 from groq import Groq
 
 # Local modules — adjust import paths to match your project structure
-from clone_repo import clone_repo          # clone_repo(url, dest_dir) -> bool | Path
-from file_scanner import scan_files        # scan_files(root) -> list[str]  (absolute paths)
-from parser import extract_chunks          # extract_chunks(filepath) -> list[str]
-from reviewer import review_file
+from core.clone_repo import clone_repo          # clone_repo(url, dest_dir) -> bool | Path
+from core.file_scanner import scan_files        # scan_files(root) -> list[str]  (absolute paths)
+from core.parser import extract_chunks          # extract_chunks(filepath) -> list[str]
+from core.reviewer import review_file
 
 logger = logging.getLogger(__name__)
 
