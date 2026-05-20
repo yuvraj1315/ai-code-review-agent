@@ -1,38 +1,24 @@
 import os
 import json
-from dotenv import load_dotenv
 from groq import Groq
-
-load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 def review_code(code_chunk):
-    # truncate huge code chunks
-    if len(code_chunk) > 3000:
-        code_chunk = code_chunk[:3000]
-
     prompt = f"""
-You are a senior software engineer.
+You are an expert Python code reviewer.
 
-Analyze this Python code.
+Analyze the following code and return ONLY valid JSON.
 
-Return ONLY JSON.
-
-Schema:
-
+Required JSON format:
 {{
-  "issue": "short issue",
-  "severity": "low/medium/high",
-  "confidence": 0,
-  "suggestion": "fix recommendation",
-  "category": "bug/security/performance/readability/reliability"
+    "issue": "short issue description",
+    "severity": "low|medium|high",
+    "confidence": 0-100,
+    "suggestion": "fix recommendation",
+    "category": "security|performance|readability|reliability"
 }}
-
-No markdown.
-No explanation.
-JSON only.
 
 Code:
 {code_chunk}
@@ -40,54 +26,31 @@ Code:
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
-            max_tokens=250
+            temperature=0.2,
+            max_tokens=300
         )
 
-        result = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
 
-        # remove markdown wrappers
-        if "```" in result:
-            result = result.replace("```json", "")
-            result = result.replace("```", "")
-            result = result.strip()
+        start = content.find("{")
+        end = content.rfind("}") + 1
 
-        # isolate JSON object safely
-        start = result.find("{")
-        end = result.rfind("}") + 1
+        if start != -1 and end != -1:
+            content = content[start:end]
 
-        result = result[start:end]
-
-        parsed = json.loads(result)
-
-        return {
-            "issue": parsed.get("issue", "Potential issue detected"),
-            "severity": parsed.get("severity", "medium").lower(),
-            "confidence": int(parsed.get("confidence", 50)),
-            "suggestion": parsed.get("suggestion", "Manual review recommended"),
-            "category": parsed.get("category", "readability").lower()
-        }
+        return json.loads(content)
 
     except Exception as e:
-     if "429" in str(e):
+        print("Review error:", e)
+
         return {
-            "issue": "API rate limit reached",
+            "issue": "AI review failed",
             "severity": "low",
             "confidence": 10,
             "suggestion": "Retry later or reduce scan size",
-            "category": "reliability"
-        }
-
-    print("Review error:", e)
-
-    return {
-            "issue": "AI review failed — manual verification required",
-            "severity": "low",
-            "confidence": 20,
-            "suggestion": "Check this code manually",
             "category": "reliability"
         }
