@@ -1,289 +1,303 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import json
-import time
-from core.pipeline import run_pipeline
+"""
+app.py — Production-grade Streamlit frontend for AI Code Review Agent.
+Fixes: state bugs, silent empty results, missing error/warning surfaces.
+"""
 
-# ---------------- PAGE CONFIG ----------------
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import time
+
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Logging — configure before any local imports so pipeline logs are visible
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Local imports
+# ---------------------------------------------------------------------------
+
+from pipeline import PipelineResult, run_pipeline  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="AI Code Review Agent",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ---------------- CUSTOM CSS ----------------
-st.markdown("""
-<style>
-    .main {
-        background-color: #0e1117;
-        color: white;
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+SEVERITY_COLOURS = {
+    "critical": "#FF4B4B",
+    "high":     "#FF8C00",
+    "medium":   "#FFA500",
+    "low":      "#4CAF50",
+    "info":     "#2196F3",
+}
+
+# ---------------------------------------------------------------------------
+# Session-state initialisation
+# Calling this once at import-time prevents KeyError on rerun.
+# ---------------------------------------------------------------------------
+
+def _init_state() -> None:
+    defaults: dict = {
+        "result": None,           # PipelineResult | None
+        "running": False,         # True while pipeline is executing
+        "last_repo_url": "",      # Detect URL changes
+        "run_id": 0,              # Incremented per run to bust stale cache
     }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
-    .metric-card {
-        background: linear-gradient(135deg, #1f2937, #111827);
-        padding: 20px;
-        border-radius: 16px;
-        box-shadow: 0px 4px 20px rgba(0,0,0,0.35);
-        text-align: center;
-        border: 1px solid #2d3748;
-    }
 
-    .metric-title {
-        font-size: 16px;
-        color: #9ca3af;
-    }
+_init_state()
 
-    .metric-value {
-        font-size: 28px;
-        font-weight: bold;
-        color: white;
-    }
+# ---------------------------------------------------------------------------
+# Sidebar — controls
+# ---------------------------------------------------------------------------
 
-    .finding-card {
-        background: #161b22;
-        padding: 15px;
-        border-radius: 14px;
-        border: 1px solid #30363d;
-        margin-bottom: 12px;
-    }
+with st.sidebar:
+    st.title("⚙️ Control Panel")
 
-    .severity-high {
-        color: #ff4b4b;
-        font-weight: bold;
-    }
-
-    .severity-medium {
-        color: #f59e0b;
-        font-weight: bold;
-    }
-
-    .severity-low {
-        color: #10b981;
-        font-weight: bold;
-    }
-
-    .hero {
-        text-align: center;
-        padding: 20px;
-        background: linear-gradient(135deg, #111827, #1e293b);
-        border-radius: 18px;
-        margin-bottom: 25px;
-        border: 1px solid #334155;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------- HERO ----------------
-st.markdown("""
-<div class="hero">
-    <h1>🤖 AI Code Review Agent</h1>
-    <p>Autonomous AI-powered code analysis using AST parsing and intelligent review pipeline</p>
-</div>
-""", unsafe_allow_html=True)
-
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("⚙ Control Panel")
-
-repo_url = st.sidebar.text_input(
-    "GitHub Repository URL",
-    placeholder="https://github.com/pallets/flask"
-)
-
-severity_filter = st.sidebar.selectbox(
-    "Severity Filter",
-    ["All", "high", "medium", "low"]
-)
-
-confidence_threshold = st.sidebar.slider(
-    "Minimum Confidence",
-    0,
-    100,
-    0
-)
-
-analyze_button = st.sidebar.button("🚀 Analyze Repository")
-
-# ---------------- MAIN LOGIC ----------------
-if analyze_button:
-
-    if not repo_url:
-        st.warning("Please enter a GitHub repository URL.")
-        st.stop()
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    steps = [
-        "Cloning repository...",
-        "Scanning Python files...",
-        "Parsing AST structures...",
-        "Running AI code review...",
-        "Generating findings..."
-    ]
-
-    for i, step in enumerate(steps):
-        status.info(step)
-        progress.progress((i + 1) * 20)
-        time.sleep(0.5)
-
-    with st.spinner("Running analysis..."):
-        try:
-            results = run_pipeline(repo_url)
-          
-        except Exception as e:
-            st.error(f"Pipeline failed: {str(e)}")
-            results = []
-
-    if not results:
-        st.error("No findings generated.")
-        st.stop()
-
-    df = pd.DataFrame(results)
-
-    # Clean file paths
-    df["file"] = df["file"].apply(
-        lambda x: x.split("temp_repos\\")[-1] if "temp_repos" in x else x
+    repo_url: str = st.text_input(
+        "GitHub Repository URL",
+        value=st.session_state.last_repo_url or "",
+        placeholder="https://github.com/owner/repo",
+        key="repo_url_input",
     )
 
-    # Apply filters
-    if severity_filter != "All":
-        df = df[df["severity"] == severity_filter]
+    severity_options = ["All", "critical", "high", "medium", "low", "info"]
+    severity_filter: str = st.selectbox(
+        "Severity Filter",
+        options=severity_options,
+        index=0,
+        key="severity_filter_input",
+    )
 
-    df = df[df["confidence"] >= confidence_threshold]
+    min_confidence: int = st.slider(
+        "Minimum Confidence",
+        min_value=0,
+        max_value=100,
+        value=60,
+        step=5,
+        key="min_confidence_input",
+        help="Drop findings where the AI confidence is below this threshold.",
+    )
 
-    # ---------------- METRICS ----------------
-    total_findings = len(df)
-    high_count = len(df[df["severity"] == "high"])
-    medium_count = len(df[df["severity"] == "medium"])
-    low_conf = len(df[df["confidence"] < 50])
+    analyze_clicked = st.button(
+        "🚀 Analyze Repository",
+        disabled=st.session_state.running,
+        use_container_width=True,
+    )
 
-    col1, col2, col3, col4 = st.columns(4)
+    st.divider()
+    st.caption("AI Code Review Agent — powered by Groq LLM + AST analysis")
 
-    with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Total Findings</div>
-            <div class="metric-value">{total_findings}</div>
-        </div>
-        """, unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Main content header
+# ---------------------------------------------------------------------------
 
-    with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">High Severity</div>
-            <div class="metric-value">{high_count}</div>
-        </div>
-        """, unsafe_allow_html=True)
+st.markdown(
+    """
+    <div style="background: linear-gradient(135deg,#1a1a2e,#16213e);
+                border-radius:12px;padding:2rem;margin-bottom:1.5rem;text-align:center;">
+        <h1 style="color:#fff;margin:0;">🤖 AI Code Review Agent</h1>
+        <p style="color:#aaa;margin-top:.5rem;">
+            Autonomous AI-powered code analysis using AST parsing and intelligent review pipeline
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    with col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Medium Severity</div>
-            <div class="metric-value">{medium_count}</div>
-        </div>
-        """, unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Handle Analyze button click — trigger pipeline
+# ---------------------------------------------------------------------------
 
-    with col4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Low Confidence</div>
-            <div class="metric-value">{low_conf}</div>
-        </div>
-        """, unsafe_allow_html=True)
+if analyze_clicked:
+    url = (repo_url or "").strip()
+    if not url:
+        st.error("Please enter a GitHub repository URL.")
+    else:
+        # Reset state for this run
+        st.session_state.result = None
+        st.session_state.running = True
+        st.session_state.last_repo_url = url
+        st.session_state.run_id += 1
 
-    st.markdown("---")
+        # ---- Progress placeholders ----
+        status_box = st.empty()
+        progress_bar = st.progress(0.0)
 
-    # ---------------- CHARTS ----------------
-    col1, col2 = st.columns(2)
+        def _update_progress(message: str, pct: float) -> None:
+            try:
+                status_box.info(f"⏳ {message}")
+                progress_bar.progress(min(max(pct, 0.0), 1.0))
+            except Exception:  # noqa: BLE001
+                pass  # UI updates are best-effort
 
-    with col1:
-        severity_counts = df["severity"].value_counts().reset_index()
-        severity_counts.columns = ["severity", "count"]
+        _update_progress("Starting pipeline…", 0.01)
 
-        fig1 = px.bar(
-            severity_counts,
-            x="severity",
-            y="count",
-            title="Severity Distribution"
+        t0 = time.time()
+        try:
+            pipeline_result: PipelineResult = run_pipeline(
+                repo_url=url,
+                min_confidence=min_confidence,
+                severity_filter=severity_filter if severity_filter != "All" else None,
+                progress_callback=_update_progress,
+            )
+        except Exception as exc:
+            # Absolute last-resort catch
+            logger.exception("run_pipeline raised unexpectedly: %s", exc)
+            pipeline_result = PipelineResult()
+            pipeline_result.errors.append(
+                f"Critical pipeline failure: {exc}. Check logs for traceback."
+            )
+
+        elapsed = time.time() - t0
+        st.session_state.result = pipeline_result
+        st.session_state.running = False
+
+        progress_bar.progress(1.0)
+        status_box.success(
+            f"Analysis complete in {elapsed:.1f}s — {pipeline_result.summary_line()}"
         )
+        logger.info("Pipeline finished in %.1fs. %s", elapsed, pipeline_result.summary_line())
 
-        st.plotly_chart(fig1, width='stretch')
+# ---------------------------------------------------------------------------
+# Results rendering
+# ---------------------------------------------------------------------------
 
-    with col2:
-        category_counts = df["category"].value_counts().reset_index()
-        category_counts.columns = ["category", "count"]
+result: PipelineResult | None = st.session_state.result
 
-        fig2 = px.pie(
-            category_counts,
-            names="category",
-            values="count",
-            title="Category Distribution"
+if result is None:
+    st.info("Enter a GitHub repository URL and click **Analyze Repository** to begin.")
+    st.stop()
+
+# ---- Errors (pipeline-level) ----
+if result.errors:
+    for err in result.errors:
+        st.error(f"🚨 **Pipeline Error**\n\n{err}")
+
+# ---- Warnings ----
+if result.warnings:
+    with st.expander(f"⚠️ {len(result.warnings)} Warning(s)", expanded=not result.findings):
+        for w in result.warnings:
+            st.warning(w)
+
+# ---- Stats ----
+if result.stats:
+    cols = st.columns(4)
+    stat_defs = [
+        ("files_found",      "📁 Files Found"),
+        ("files_reviewed",   "🔍 Files Reviewed"),
+        ("raw_findings",     "📋 Raw Findings"),
+        ("filtered_findings","✅ Filtered Findings"),
+    ]
+    for col, (key, label) in zip(cols, stat_defs):
+        col.metric(label, result.stats.get(key, 0))
+
+st.divider()
+
+# ---- No findings ----
+if not result.findings:
+    if result.success and not result.errors:
+        st.success(
+            "✅ No findings matched the current filters. "
+            "Try adjusting Severity Filter or Minimum Confidence."
         )
+    elif result.errors:
+        st.error("Pipeline encountered errors. See details above.")
+    else:
+        st.warning("No findings generated. See warnings above for details.")
+    st.stop()
 
-        st.plotly_chart(fig2, width='stretch')
+# ---- Sort findings: severity order, then confidence descending ----
+sorted_findings = sorted(
+    result.findings,
+    key=lambda f: (
+        SEVERITY_ORDER.get(f.get("severity", "info").lower(), 99),
+        -(f.get("confidence") or 0),
+    ),
+)
 
-    st.markdown("---")
+# ---- Findings header ----
+st.subheader(f"🔎 {len(sorted_findings)} Finding(s)")
 
-    # ---------------- FINDINGS ----------------
-    st.subheader("📋 Review Findings")
+# ---- Render each finding ----
+for idx, finding in enumerate(sorted_findings, start=1):
+    severity = (finding.get("severity") or "info").lower()
+    colour = SEVERITY_COLOURS.get(severity, "#888")
+    filename = finding.get("filename", "unknown")
+    category = finding.get("category", "general")
+    description = finding.get("description", "No description.")
+    suggestion = finding.get("suggestion", "")
+    line = finding.get("line")
+    confidence = finding.get("confidence", 0)
+    summary = finding.get("summary", "")
 
-    for idx, row in df.iterrows():
+    line_str = f"Line {line}" if line else "—"
 
-        severity_class = f"severity-{row['severity']}"
+    with st.expander(
+        f"[{severity.upper()}] {filename} — {category} ({line_str})",
+        expanded=(severity in ("critical", "high")),
+    ):
+        col_left, col_right = st.columns([3, 1])
 
-        with st.expander(f"🔍 {row['issue']} ({row['name']})"):
+        with col_left:
+            st.markdown(
+                f"<span style='color:{colour};font-weight:700;font-size:1.05rem;'>"
+                f"{'🔴' if severity == 'critical' else '🟠' if severity == 'high' else '🟡' if severity == 'medium' else '🟢' if severity == 'low' else '🔵'} "
+                f"{severity.capitalize()}</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(f"**Description:** {description}")
+            if suggestion:
+                st.markdown(f"**Suggestion:** {suggestion}")
+            if summary:
+                st.caption(f"Chunk summary: {summary}")
 
-            st.markdown(f"""
-            <div class="finding-card">
-                <p><b>File:</b> {row['file']}</p>
-                <p><b>Line:</b> {row['line']}</p>
-                <p><b>Type:</b> {row['type']}</p>
-                <p><b>Severity:</b> <span class="{severity_class}">{row['severity'].upper()}</span></p>
-                <p><b>Confidence:</b> {row['confidence']}%</p>
-                <p><b>Category:</b> {row['category']}</p>
-                <p><b>Suggestion:</b> {row['suggestion']}</p>
-            </div>
-            """, unsafe_allow_html=True)
+        with col_right:
+            st.metric("Confidence", f"{confidence}%")
+            st.caption(f"File: `{filename}`")
+            if line:
+                st.caption(f"Line: `{line}`")
 
-    # ---------------- LOW CONFIDENCE ----------------
-    low_conf_df = df[df["confidence"] < 50]
+# ---------------------------------------------------------------------------
+# Debug expander — always available for troubleshooting
+# ---------------------------------------------------------------------------
 
-    if not low_conf_df.empty:
-        st.markdown("---")
-        st.subheader("⚠ Verify These Findings")
-
-        st.warning(
-            "These findings have low AI confidence and should be manually verified."
-        )
-
-        for _, row in low_conf_df.iterrows():
-            st.error(f"{row['issue']} → {row['file']}")
-
-    # ---------------- EXPORT ----------------
-    st.markdown("---")
-    st.subheader("⬇ Export Reports")
-
-    csv_data = df.to_csv(index=False).encode("utf-8")
-    json_data = df.to_json(orient="records", indent=2)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.download_button(
-            "Download CSV Report",
-            csv_data,
-            "review_results.csv",
-            "text/csv"
-        )
-
-    with col2:
-        st.download_button(
-            "Download JSON Report",
-            json_data,
-            "review_results.json",
-            "application/json"
-        )
-
-else:
-    st.info("Enter a GitHub repository URL from the sidebar and click Analyze.")
+with st.expander("🛠️ Debug Info", expanded=False):
+    st.json({
+        "run_id": st.session_state.run_id,
+        "repo_url": st.session_state.last_repo_url,
+        "min_confidence": min_confidence,
+        "severity_filter": severity_filter,
+        "pipeline_success": result.success if result else None,
+        "stats": result.stats if result else {},
+        "error_count": len(result.errors) if result else 0,
+        "warning_count": len(result.warnings) if result else 0,
+        "finding_count": len(result.findings) if result else 0,
+        "groq_api_key_set": bool(os.environ.get("GROQ_API_KEY")),
+    })
