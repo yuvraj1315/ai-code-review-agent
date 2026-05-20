@@ -130,7 +130,7 @@ if analyze_button:
     with st.spinner("Running analysis..."):
         try:
             results = run_pipeline(repo_url)
-            st.write("Debug results:", results)
+          
         except Exception as e:
             st.error(f"Pipeline failed: {str(e)}")
             results = []

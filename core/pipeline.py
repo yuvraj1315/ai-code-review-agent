@@ -12,57 +12,48 @@ from core.confidence import classify_confidence
 def run_pipeline(repo_url: str) -> List[Dict[str, Any]]:
     results = []
 
-    try:
-        repo_path = clone_repository(repo_url)
-        python_files = scan_python_files(repo_path)
-        print("FILES FOUND:", python_files)
+    print("STEP 1: Cloning repo...")
+    repo_path = clone_repository(repo_url)
+    print("CLONED TO:", repo_path)
 
-        # Limit API usage for testing/demo
-        python_files = python_files[:2]
+    print("STEP 2: Scanning files...")
+    python_files = scan_python_files(repo_path)
+    print("FILES FOUND:", len(python_files))
+    print(python_files)
 
-        for file_path in python_files:
-            try:
-                chunks = extract_code_chunks(file_path)
-                print("CHUNKS FOUND:", chunks)
+    python_files = python_files[:1]
 
-                for chunk in chunks[:3]:
+    for file_path in python_files:
+        print("PROCESSING FILE:", file_path)
 
-                    # Skip tiny wrapper/helper functions
-                    if chunk["type"] == "function" and chunk["name"] in ["wrapper", "inner"]:
-                        continue
+        chunks = extract_code_chunks(file_path)
+        print("CHUNKS FOUND:", len(chunks))
 
-                    review = review_code(chunk["code"])
+        if chunks:
+            print("FIRST CHUNK:", chunks[0])
 
-                    confidence = review.get("confidence", 0)
+        for chunk in chunks[:2]:
+            print("REVIEWING:", chunk["name"])
 
-                    results.append({
-                        "file": chunk["file"],
-                        "line": chunk["line"],
-                        "type": chunk["type"],
-                        "name": chunk["name"],
-                        "issue": review.get("issue"),
-                        "severity": review.get("severity"),
-                        "confidence": confidence,
-                        "confidence_label": classify_confidence(confidence),
-                        "suggestion": review.get("suggestion"),
-                        "category": review.get("category")
-                    })
+            review = review_code(chunk["code"])
+            print("REVIEW RESULT:", review)
 
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+            confidence = review.get("confidence", 0)
 
-    except Exception as e:
-        print(f"Pipeline failed: {e}")
+            results.append({
+                "file": chunk["file"],
+                "line": chunk["line"],
+                "type": chunk["type"],
+                "name": chunk["name"],
+                "issue": review.get("issue"),
+                "severity": review.get("severity"),
+                "confidence": confidence,
+                "confidence_label": classify_confidence(confidence),
+                "suggestion": review.get("suggestion"),
+                "category": review.get("category")
+            })
 
-    # Save CSV report
-    try:
-        outputs_dir = Path("outputs")
-        outputs_dir.mkdir(exist_ok=True)
-
-        df = pd.DataFrame(results)
-        df.to_csv(outputs_dir / "review_results.csv", index=False)
-
-    except Exception as e:
-        print("CSV save failed:", e)
+    Path("outputs").mkdir(exist_ok=True)
+    pd.DataFrame(results).to_csv("outputs/review_results.csv", index=False)
 
     return results
