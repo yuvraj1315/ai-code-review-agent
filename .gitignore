@@ -1,0 +1,9 @@
+venv/
+.env
+temp_repos/
+outputs/
+__pycache__/
+*.pyc
+.streamlit/
+.idea/
+.vscode/
