@@ -19,7 +19,7 @@ MAX_RETRIES = 4
 INITIAL_BACKOFF = 1.0
 BACKOFF_MULTIPLIER = 2.0
 MAX_CHUNK_CHARS = 6_000
-MODEL = "llama3-70b-8192"
+MODEL = "llama-3.3-70b-versatile"
 
 SYSTEM_PROMPT = """You are a senior Python code reviewer. You review Python code and return
 ONLY a JSON object — no markdown, no code fences, no extra text whatsoever.
