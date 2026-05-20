@@ -1,20 +1,20 @@
 """
 app.py — Production-grade Streamlit frontend for AI Code Review Agent.
 Fixes: state bugs, silent empty results, missing error/warning surfaces.
+Features: download as CSV, JSON, Markdown; filter by category.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import os
 import sys
 import time
 
 import streamlit as st
-
-# ---------------------------------------------------------------------------
-# Logging — configure before any local imports so pipeline logs are visible
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,15 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Local imports
-# ---------------------------------------------------------------------------
-
 from core.pipeline import PipelineResult, run_pipeline
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="AI Code Review Agent",
@@ -40,10 +32,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_COLOURS = {
@@ -53,28 +41,84 @@ SEVERITY_COLOURS = {
     "low":      "#4CAF50",
     "info":     "#2196F3",
 }
+SEVERITY_EMOJI = {
+    "critical": "🔴",
+    "high":     "🟠",
+    "medium":   "🟡",
+    "low":      "🟢",
+    "info":     "🔵",
+}
+
 
 # ---------------------------------------------------------------------------
-# Session-state initialisation
-# Calling this once at import-time prevents KeyError on rerun.
+# Download helpers
+# ---------------------------------------------------------------------------
+
+def _to_csv(findings: list[dict]) -> bytes:
+    buf = io.StringIO()
+    if not findings:
+        return b""
+    writer = csv.DictWriter(buf, fieldnames=[
+        "filename", "chunk_name", "chunk_type", "severity",
+        "category", "description", "line", "suggestion", "confidence", "summary"
+    ], extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(findings)
+    return buf.getvalue().encode("utf-8")
+
+
+def _to_json(findings: list[dict]) -> bytes:
+    return json.dumps(findings, indent=2, default=str).encode("utf-8")
+
+
+def _to_markdown(findings: list[dict], repo_url: str) -> bytes:
+    lines = [
+        f"# AI Code Review Report",
+        f"**Repository:** {repo_url}",
+        f"**Total findings:** {len(findings)}",
+        "",
+        "---",
+        "",
+    ]
+    for i, f in enumerate(findings, 1):
+        sev = (f.get("severity") or "info").lower()
+        emoji = SEVERITY_EMOJI.get(sev, "🔵")
+        lines += [
+            f"## {i}. {emoji} [{sev.upper()}] `{f.get('filename', 'unknown')}`",
+            f"- **Function/Class:** `{f.get('chunk_name', '—')}`  ({f.get('chunk_type', '—')})",
+            f"- **Category:** {f.get('category', '—')}",
+            f"- **Line:** {f.get('line') or f.get('chunk_line') or '—'}",
+            f"- **Confidence:** {f.get('confidence', 0)}%",
+            f"",
+            f"**Description:** {f.get('description', '')}",
+            f"",
+            f"**Suggestion:** {f.get('suggestion', '')}",
+            f"",
+            "---",
+            "",
+        ]
+    return "\n".join(lines).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Session state
 # ---------------------------------------------------------------------------
 
 def _init_state() -> None:
-    defaults: dict = {
-        "result": None,           # PipelineResult | None
-        "running": False,         # True while pipeline is executing
-        "last_repo_url": "",      # Detect URL changes
-        "run_id": 0,              # Incremented per run to bust stale cache
+    defaults = {
+        "result": None,
+        "running": False,
+        "last_repo_url": "",
+        "run_id": 0,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
-
 _init_state()
 
 # ---------------------------------------------------------------------------
-# Sidebar — controls
+# Sidebar
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
@@ -111,11 +155,24 @@ with st.sidebar:
         use_container_width=True,
     )
 
+    # ---- Category filter (populated after analysis) ----
+    result_for_sidebar: PipelineResult | None = st.session_state.result
+    category_filter = "All"
+    if result_for_sidebar and result_for_sidebar.findings:
+        st.divider()
+        st.markdown("**Filter by Category**")
+        all_categories = sorted({f.get("category", "general") for f in result_for_sidebar.findings})
+        category_filter = st.selectbox(
+            "Category",
+            options=["All"] + all_categories,
+            key="category_filter_input",
+        )
+
     st.divider()
     st.caption("AI Code Review Agent — powered by Groq LLM + AST analysis")
 
 # ---------------------------------------------------------------------------
-# Main content header
+# Header
 # ---------------------------------------------------------------------------
 
 st.markdown(
@@ -132,7 +189,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# Handle Analyze button click — trigger pipeline
+# Run pipeline
 # ---------------------------------------------------------------------------
 
 if analyze_clicked:
@@ -140,13 +197,11 @@ if analyze_clicked:
     if not url:
         st.error("Please enter a GitHub repository URL.")
     else:
-        # Reset state for this run
         st.session_state.result = None
         st.session_state.running = True
         st.session_state.last_repo_url = url
         st.session_state.run_id += 1
 
-        # ---- Progress placeholders ----
         status_box = st.empty()
         progress_bar = st.progress(0.0)
 
@@ -154,12 +209,12 @@ if analyze_clicked:
             try:
                 status_box.info(f"⏳ {message}")
                 progress_bar.progress(min(max(pct, 0.0), 1.0))
-            except Exception:  # noqa: BLE001
-                pass  # UI updates are best-effort
+            except Exception:
+                pass
 
-        _update_progress("Starting pipeline…", 0.01)
-
+        _update_progress("Starting pipeline...", 0.01)
         t0 = time.time()
+
         try:
             pipeline_result: PipelineResult = run_pipeline(
                 repo_url=url,
@@ -168,12 +223,9 @@ if analyze_clicked:
                 progress_callback=_update_progress,
             )
         except Exception as exc:
-            # Absolute last-resort catch
             logger.exception("run_pipeline raised unexpectedly: %s", exc)
             pipeline_result = PipelineResult()
-            pipeline_result.errors.append(
-                f"Critical pipeline failure: {exc}. Check logs for traceback."
-            )
+            pipeline_result.errors.append(f"Critical pipeline failure: {exc}.")
 
         elapsed = time.time() - t0
         st.session_state.result = pipeline_result
@@ -184,9 +236,10 @@ if analyze_clicked:
             f"Analysis complete in {elapsed:.1f}s — {pipeline_result.summary_line()}"
         )
         logger.info("Pipeline finished in %.1fs. %s", elapsed, pipeline_result.summary_line())
+        st.rerun()
 
 # ---------------------------------------------------------------------------
-# Results rendering
+# Results
 # ---------------------------------------------------------------------------
 
 result: PipelineResult | None = st.session_state.result
@@ -195,72 +248,115 @@ if result is None:
     st.info("Enter a GitHub repository URL and click **Analyze Repository** to begin.")
     st.stop()
 
-# ---- Errors (pipeline-level) ----
 if result.errors:
     for err in result.errors:
         st.error(f"🚨 **Pipeline Error**\n\n{err}")
 
-# ---- Warnings ----
 if result.warnings:
     with st.expander(f"⚠️ {len(result.warnings)} Warning(s)", expanded=not result.findings):
         for w in result.warnings:
             st.warning(w)
 
-# ---- Stats ----
 if result.stats:
     cols = st.columns(4)
     stat_defs = [
-        ("files_found",      "📁 Files Found"),
-        ("files_reviewed",   "🔍 Files Reviewed"),
-        ("raw_findings",     "📋 Raw Findings"),
-        ("filtered_findings","✅ Filtered Findings"),
+        ("files_found",       "📁 Files Found"),
+        ("files_reviewed",    "🔍 Files Reviewed"),
+        ("raw_findings",      "📋 Raw Findings"),
+        ("filtered_findings", "✅ Filtered Findings"),
     ]
     for col, (key, label) in zip(cols, stat_defs):
         col.metric(label, result.stats.get(key, 0))
 
 st.divider()
 
-# ---- No findings ----
 if not result.findings:
     if result.success and not result.errors:
-        st.success(
-            "✅ No findings matched the current filters. "
-            "Try adjusting Severity Filter or Minimum Confidence."
-        )
+        st.success("✅ No findings matched the current filters. Try adjusting Severity Filter or Minimum Confidence.")
     elif result.errors:
         st.error("Pipeline encountered errors. See details above.")
     else:
         st.warning("No findings generated. See warnings above for details.")
     st.stop()
 
-# ---- Sort findings: severity order, then confidence descending ----
+# ---------------------------------------------------------------------------
+# Apply category filter + sort
+# ---------------------------------------------------------------------------
+
+filtered_findings = result.findings
+if category_filter != "All":
+    filtered_findings = [f for f in filtered_findings if f.get("category", "general") == category_filter]
+
 sorted_findings = sorted(
-    result.findings,
+    filtered_findings,
     key=lambda f: (
         SEVERITY_ORDER.get(f.get("severity", "info").lower(), 99),
         -(f.get("confidence") or 0),
     ),
 )
 
-# ---- Findings header ----
+# ---------------------------------------------------------------------------
+# Download bar
+# ---------------------------------------------------------------------------
+
 st.subheader(f"🔎 {len(sorted_findings)} Finding(s)")
 
-# ---- Render each finding ----
+dl_col1, dl_col2, dl_col3, dl_spacer = st.columns([1, 1, 1, 3])
+
+repo_slug = (st.session_state.last_repo_url or "findings").split("/")[-1] or "findings"
+
+with dl_col1:
+    st.download_button(
+        label="⬇️ Download CSV",
+        data=_to_csv(sorted_findings),
+        file_name=f"{repo_slug}_review.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+with dl_col2:
+    st.download_button(
+        label="⬇️ Download JSON",
+        data=_to_json(sorted_findings),
+        file_name=f"{repo_slug}_review.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+with dl_col3:
+    st.download_button(
+        label="⬇️ Download Markdown",
+        data=_to_markdown(sorted_findings, st.session_state.last_repo_url),
+        file_name=f"{repo_slug}_review.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Findings list
+# ---------------------------------------------------------------------------
+
 for idx, finding in enumerate(sorted_findings, start=1):
     severity = (finding.get("severity") or "info").lower()
     colour = SEVERITY_COLOURS.get(severity, "#888")
     filename = finding.get("filename", "unknown")
+    chunk_name = finding.get("chunk_name", "")
+    chunk_type = finding.get("chunk_type", "")
     category = finding.get("category", "general")
     description = finding.get("description", "No description.")
     suggestion = finding.get("suggestion", "")
-    line = finding.get("line")
+    line = finding.get("line") or finding.get("chunk_line")
     confidence = finding.get("confidence", 0)
     summary = finding.get("summary", "")
+    emoji = SEVERITY_EMOJI.get(severity, "🔵")
 
     line_str = f"Line {line}" if line else "—"
+    chunk_str = f"`{chunk_name}`" if chunk_name and chunk_name != "unknown" else ""
 
     with st.expander(
-        f"[{severity.upper()}] {filename} — {category} ({line_str})",
+        f"{emoji} [{severity.upper()}] {filename} — {category} ({line_str})",
         expanded=(severity in ("critical", "high")),
     ):
         col_left, col_right = st.columns([3, 1])
@@ -268,24 +364,27 @@ for idx, finding in enumerate(sorted_findings, start=1):
         with col_left:
             st.markdown(
                 f"<span style='color:{colour};font-weight:700;font-size:1.05rem;'>"
-                f"{'🔴' if severity == 'critical' else '🟠' if severity == 'high' else '🟡' if severity == 'medium' else '🟢' if severity == 'low' else '🔵'} "
-                f"{severity.capitalize()}</span>",
+                f"{emoji} {severity.capitalize()}</span>",
                 unsafe_allow_html=True,
             )
+            if chunk_str:
+                st.markdown(f"**{chunk_type.replace('_', ' ').title()}:** {chunk_str}")
             st.markdown(f"**Description:** {description}")
             if suggestion:
                 st.markdown(f"**Suggestion:** {suggestion}")
             if summary:
-                st.caption(f"Chunk summary: {summary}")
+                st.caption(f"Summary: {summary}")
 
         with col_right:
             st.metric("Confidence", f"{confidence}%")
             st.caption(f"File: `{filename}`")
             if line:
                 st.caption(f"Line: `{line}`")
+            if chunk_name and chunk_name != "unknown":
+                st.caption(f"Function: `{chunk_name}`")
 
 # ---------------------------------------------------------------------------
-# Debug expander — always available for troubleshooting
+# Debug expander
 # ---------------------------------------------------------------------------
 
 with st.expander("🛠️ Debug Info", expanded=False):
@@ -294,6 +393,7 @@ with st.expander("🛠️ Debug Info", expanded=False):
         "repo_url": st.session_state.last_repo_url,
         "min_confidence": min_confidence,
         "severity_filter": severity_filter,
+        "category_filter": category_filter,
         "pipeline_success": result.success if result else None,
         "stats": result.stats if result else {},
         "error_count": len(result.errors) if result else 0,
