@@ -15,6 +15,7 @@ def run_pipeline(repo_url: str) -> List[Dict[str, Any]]:
     try:
         repo_path = clone_repository(repo_url)
         python_files = scan_python_files(repo_path)
+        print("FILES FOUND:", python_files)
 
         # Limit API usage for testing/demo
         python_files = python_files[:2]
@@ -22,6 +23,7 @@ def run_pipeline(repo_url: str) -> List[Dict[str, Any]]:
         for file_path in python_files:
             try:
                 chunks = extract_code_chunks(file_path)
+                print("CHUNKS FOUND:", chunks)
 
                 for chunk in chunks[:3]:
 
