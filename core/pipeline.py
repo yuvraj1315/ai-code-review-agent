@@ -14,17 +14,12 @@ from typing import Any, Callable
 
 from groq import Groq
 
-# Local modules — using actual function names from each file
-from core.clone_repo import clone_repository    # clone_repository(url) -> str (path)
-from core.file_scanner import scan_python_files # scan_python_files(repo_path) -> list[str]
-from core.parser import extract_code_chunks     # extract_code_chunks(file_path) -> list[dict|str]
+from core.clone_repo import clone_repository
+from core.file_scanner import scan_python_files
+from core.parser import extract_code_chunks
 from core.reviewer import review_file
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -44,11 +39,6 @@ class PipelineResult:
         return f"{n} finding(s) across {files} file(s)."
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
 def _get_groq_client() -> Groq:
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -59,41 +49,40 @@ def _get_groq_client() -> Groq:
     return Groq(api_key=api_key)
 
 
-def _normalise_chunks(raw_chunks: list) -> list[str]:
+def _normalise_chunks(raw_chunks: list) -> list[dict[str, Any]]:
     """
-    Convert whatever parser.py returns into a clean list[str].
-    Handles: list[str], list[dict] with any common key name.
+    Convert parser output into a list of dicts with guaranteed 'code' and metadata keys.
+    parser.py returns: [{"type": "function"|"class", "name": str, "line": int, "file": str, "code": str}]
     """
-    chunks: list[str] = []
+    normalised = []
     for c in raw_chunks:
-        if isinstance(c, str):
-            chunks.append(c)
-        elif isinstance(c, dict):
-            # Try common key names parsers use for the code string
-            code = (
-                c.get("code")
-                or c.get("content")
-                or c.get("source")
-                or c.get("chunk")
-                or c.get("text")
-                or c.get("body")
-                or ""
-            )
-            chunks.append(str(code) if not isinstance(code, str) else code)
+        if isinstance(c, dict):
+            code = c.get("code") or c.get("content") or c.get("source") or c.get("text") or ""
+            if not isinstance(code, str):
+                code = str(code)
+            if not code.strip():
+                continue
+            normalised.append({
+                "code": code,
+                "name": c.get("name", "unknown"),
+                "type": c.get("type", "unknown"),
+                "line": c.get("line", 0),
+                "file": c.get("file", ""),
+            })
+        elif isinstance(c, str):
+            if c.strip():
+                normalised.append({"code": c, "name": "unknown", "type": "unknown", "line": 0, "file": ""})
         else:
-            chunks.append(str(c))
-
-    return [c for c in chunks if c.strip()]  # drop empty / whitespace-only
+            s = str(c)
+            if s.strip():
+                normalised.append({"code": s, "name": "unknown", "type": "unknown", "line": 0, "file": ""})
+    return normalised
 
 
 def _flatten_file_results(
     file_results: list[dict[str, Any]],
     min_confidence: int,
 ) -> list[dict[str, Any]]:
-    """
-    Flatten chunk-level results into a single findings list,
-    applying confidence filter and ensuring required keys.
-    """
     findings: list[dict[str, Any]] = []
     for result in file_results:
         confidence = result.get("confidence", 0)
@@ -101,25 +90,20 @@ def _flatten_file_results(
             logger.debug("Skipping result for '%s' — confidence %d < %d",
                          result.get("filename"), confidence, min_confidence)
             continue
-
         for issue in result.get("issues", []):
             findings.append({
                 "filename": result.get("filename", "unknown"),
+                "chunk_name": result.get("chunk_name", ""),
+                "chunk_type": result.get("chunk_type", ""),
                 "severity": issue.get("severity", "info"),
                 "category": issue.get("category", "general"),
                 "description": issue.get("description", ""),
-                "line": issue.get("line"),
+                "line": issue.get("line") or result.get("chunk_line"),
                 "suggestion": issue.get("suggestion", ""),
                 "confidence": confidence,
                 "summary": result.get("summary", ""),
             })
-
     return findings
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def run_pipeline(
@@ -128,34 +112,19 @@ def run_pipeline(
     severity_filter: str | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> PipelineResult:
-    """
-    Full end-to-end pipeline.
-
-    Args:
-        repo_url:          GitHub repository URL.
-        min_confidence:    Drop findings below this confidence score (0-100).
-        severity_filter:   If set, keep only findings with this severity level.
-        progress_callback: Optional callable(message: str, pct: float) for UI updates.
-
-    Returns:
-        PipelineResult - always populated; never silently empty.
-    """
 
     def _progress(msg: str, pct: float = 0.0) -> None:
         logger.info("[pipeline] %.0f%% — %s", pct * 100, msg)
         if progress_callback:
             try:
                 progress_callback(msg, pct)
-            except Exception:  # noqa: BLE001
-                pass  # UI callback failures must not kill the pipeline
+            except Exception:
+                pass
 
     result = PipelineResult()
     tmp_dir: str | None = None
 
     try:
-        # ------------------------------------------------------------------
-        # 1. Validate inputs
-        # ------------------------------------------------------------------
         repo_url = (repo_url or "").strip()
         if not repo_url:
             result.errors.append("Repository URL is empty.")
@@ -165,9 +134,6 @@ def run_pipeline(
             result.errors.append(f"Invalid repository URL: {repo_url!r}")
             return result
 
-        # ------------------------------------------------------------------
-        # 2. Initialise Groq client early — fail fast if key is missing
-        # ------------------------------------------------------------------
         _progress("Initialising AI client...", 0.02)
         try:
             client = _get_groq_client()
@@ -175,38 +141,25 @@ def run_pipeline(
             result.errors.append(str(exc))
             return result
 
-        # ------------------------------------------------------------------
-        # 3. Clone repository
-        # ------------------------------------------------------------------
         _progress(f"Cloning {repo_url}...", 0.05)
-
         try:
-            tmp_dir = clone_repository(repo_url)   # manages its own temp dir
+            tmp_dir = clone_repository(repo_url)
             if not tmp_dir:
-                result.errors.append(
-                    f"clone_repository() returned empty path for URL: {repo_url}. "
-                    "Check network access and repository visibility."
-                )
+                result.errors.append(f"clone_repository() returned empty path for URL: {repo_url}.")
                 return result
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             result.errors.append(f"Cloning failed: {exc}\n{traceback.format_exc()}")
             return result
 
-        # ------------------------------------------------------------------
-        # 4. Scan for Python files
-        # ------------------------------------------------------------------
         _progress("Scanning for Python files...", 0.15)
         try:
             python_files: list[str] = scan_python_files(tmp_dir)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             result.errors.append(f"File scanning failed: {exc}\n{traceback.format_exc()}")
             return result
 
         if not python_files:
-            result.warnings.append(
-                "No Python files found in this repository. "
-                "The repo may not contain .py files or may be empty."
-            )
+            result.warnings.append("No Python files found in this repository.")
             result.success = True
             result.stats["files_found"] = 0
             return result
@@ -214,9 +167,6 @@ def run_pipeline(
         result.stats["files_found"] = len(python_files)
         _progress(f"Found {len(python_files)} Python file(s).", 0.20)
 
-        # ------------------------------------------------------------------
-        # 5. Parse + review each file
-        # ------------------------------------------------------------------
         all_findings: list[dict[str, Any]] = []
         files_reviewed = 0
         files_with_errors = 0
@@ -226,10 +176,9 @@ def run_pipeline(
             short_path = filepath.replace(tmp_dir, "").lstrip("/\\")
             _progress(f"Reviewing {short_path}...", pct)
 
-            # --- Parse ---
             try:
                 raw_chunks = extract_code_chunks(filepath)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 warn = f"AST parsing failed for {short_path}: {exc}"
                 logger.warning(warn)
                 result.warnings.append(warn)
@@ -238,26 +187,18 @@ def run_pipeline(
 
             if not raw_chunks:
                 logger.debug("No chunks extracted from %s — skipping.", short_path)
-                result.warnings.append(f"No code chunks extracted from {short_path}.")
                 continue
 
-            # --- Normalise: parser may return list[str] OR list[dict] ---
             chunks = _normalise_chunks(raw_chunks)
-            logger.info("[%s] %d raw chunks -> %d normalised string chunks.",
-                        short_path, len(raw_chunks), len(chunks))
+            logger.info("[%s] %d raw -> %d normalised chunks.", short_path, len(raw_chunks), len(chunks))
 
             if not chunks:
-                result.warnings.append(
-                    f"All chunks were empty after normalisation: {short_path}. "
-                    f"Parser returned type: {type(raw_chunks[0]).__name__} — "
-                    f"keys: {list(raw_chunks[0].keys()) if isinstance(raw_chunks[0], dict) else 'n/a'}"
-                )
+                result.warnings.append(f"All chunks empty after normalisation: {short_path}.")
                 continue
 
-            # --- Send to LLM reviewer ---
             try:
                 file_reviews = review_file(client, chunks, short_path)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 warn = f"Review failed for {short_path}: {exc}"
                 logger.error("%s\n%s", warn, traceback.format_exc())
                 result.warnings.append(warn)
@@ -272,23 +213,16 @@ def run_pipeline(
         result.stats["files_with_errors"] = files_with_errors
         result.stats["raw_findings"] = len(all_findings)
 
-        # ------------------------------------------------------------------
-        # 6. Apply severity filter
-        # ------------------------------------------------------------------
         if severity_filter and severity_filter.lower() not in ("all", ""):
             before = len(all_findings)
             all_findings = [
                 f for f in all_findings
                 if f.get("severity", "").lower() == severity_filter.lower()
             ]
-            logger.info("Severity filter '%s': %d -> %d findings.",
-                        severity_filter, before, len(all_findings))
+            logger.info("Severity filter '%s': %d -> %d findings.", severity_filter, before, len(all_findings))
 
         result.stats["filtered_findings"] = len(all_findings)
 
-        # ------------------------------------------------------------------
-        # 7. Guard: if we reviewed files but got zero findings after filtering
-        # ------------------------------------------------------------------
         if files_reviewed > 0 and not all_findings:
             result.warnings.append(
                 f"Analysis completed but no findings matched the current filters "
@@ -300,17 +234,15 @@ def run_pipeline(
         result.success = True
         _progress(f"Done — {result.summary_line()}", 1.0)
 
-    except Exception as exc:  # noqa: BLE001
-        result.errors.append(
-            f"Unexpected pipeline error: {exc}\n{traceback.format_exc()}"
-        )
+    except Exception as exc:
+        result.errors.append(f"Unexpected pipeline error: {exc}\n{traceback.format_exc()}")
         logger.critical("Unhandled pipeline exception: %s", exc, exc_info=True)
 
     finally:
         if tmp_dir and os.path.exists(tmp_dir):
             try:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     return result
