@@ -8,17 +8,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import tempfile
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from groq import Groq
 
-# Local modules — adjust import paths to match your project structure
-from core.clone_repo import clone_repo          # clone_repo(url, dest_dir) -> bool | Path
-from core.file_scanner import scan_files        # scan_files(root) -> list[str]  (absolute paths)
-from core.parser import extract_chunks          # extract_chunks(filepath) -> list[str]
+# Local modules — using actual function names from each file
+from core.clone_repo import clone_repository   # clone_repository(url) -> str (path)
+from core.file_scanner import scan_python_files # scan_python_files(repo_path) -> list[str]
+from core.parser import extract_code_chunks     # extract_code_chunks(file_path) -> list[str]
 from core.reviewer import review_file
 
 logger = logging.getLogger(__name__)
@@ -152,15 +151,13 @@ def run_pipeline(
         # ------------------------------------------------------------------
         # 3. Clone repository
         # ------------------------------------------------------------------
-        tmp_dir = tempfile.mkdtemp(prefix="ai_review_")
         _progress(f"Cloning {repo_url}…", 0.05)
 
         try:
-            clone_result = clone_repo(repo_url, tmp_dir)
-            # Accept both bool True and a truthy Path
-            if not clone_result:
+            tmp_dir = clone_repository(repo_url)   # manages its own temp dir
+            if not tmp_dir:
                 result.errors.append(
-                    f"clone_repo() returned falsy for URL: {repo_url}. "
+                    f"clone_repository() returned empty path for URL: {repo_url}. "
                     "Check network access and repository visibility."
                 )
                 return result
@@ -173,7 +170,7 @@ def run_pipeline(
         # ------------------------------------------------------------------
         _progress("Scanning for Python files…", 0.15)
         try:
-            python_files: list[str] = scan_files(tmp_dir)
+            python_files: list[str] = scan_python_files(tmp_dir)
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"File scanning failed: {exc}\n{traceback.format_exc()}")
             return result
@@ -204,7 +201,7 @@ def run_pipeline(
 
             # Parse
             try:
-                chunks: list[str] = extract_chunks(filepath)
+                chunks: list[str] = extract_code_chunks(filepath)
             except Exception as exc:  # noqa: BLE001
                 warn = f"AST parsing failed for {short_path}: {exc}"
                 logger.warning(warn)

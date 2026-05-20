@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Local imports
 # ---------------------------------------------------------------------------
 
-from core.pipeline import PipelineResult, run_pipeline  # noqa: E402
+from core.pipeline import PipelineResult, run_pipeline
 
 # ---------------------------------------------------------------------------
 # Page config
