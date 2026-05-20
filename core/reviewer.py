@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 4
 INITIAL_BACKOFF = 1.0
 BACKOFF_MULTIPLIER = 2.0
-MAX_CHUNK_CHARS = 6_000
-MODEL = "llama-3.3-70b-versatile"
+MAX_CHUNK_CHARS = 3_000   # halved to reduce token usage
+MODEL = "llama-3.1-8b-instant"   # 8B model — much lower token usage, still good for code review
 
 SYSTEM_PROMPT = """You are a senior Python code reviewer. You review Python code and return
 ONLY a JSON object — no markdown, no code fences, no extra text whatsoever.
@@ -159,7 +159,7 @@ def review_chunk(
                     {"role": "user", "content": user_message},
                 ],
                 temperature=0.1,
-                max_tokens=1024,
+                max_tokens=512,   # reduced to save daily token budget
             )
 
             raw = response.choices[0].message.content or ""
@@ -183,9 +183,21 @@ def review_chunk(
             return validated
 
         except RateLimitError as exc:
+            err_str = str(exc)
+            last_error = exc
+            # Detect daily token limit (TPD) — retrying won't help, fail fast
+            if "tokens per day" in err_str or "per day" in err_str.lower():
+                # Extract wait time from message e.g. "try again in 12m51s"
+                wait_match = re.search(r'try again in (\d+)m(\d+)', err_str)
+                wait_hint = ""
+                if wait_match:
+                    wait_hint = f" (daily limit — try again in {wait_match.group(1)}m{wait_match.group(2)}s)"
+                logger.error("[%s] '%s': daily token limit exhausted%s — aborting retries.",
+                             filename, chunk_name, wait_hint)
+                last_error = Exception(f"Daily Groq token limit exhausted{wait_hint}")
+                break  # No point retrying — limit won't reset mid-run
             logger.warning("[%s] '%s' attempt %d: rate limit — waiting %.1fs",
                            filename, chunk_name, attempt, backoff)
-            last_error = exc
             time.sleep(backoff)
             backoff = min(backoff * BACKOFF_MULTIPLIER, 60)
 
