@@ -15,9 +15,9 @@ from typing import Any, Callable
 from groq import Groq
 
 # Local modules — using actual function names from each file
-from core.clone_repo import clone_repository   # clone_repository(url) -> str (path)
+from core.clone_repo import clone_repository    # clone_repository(url) -> str (path)
 from core.file_scanner import scan_python_files # scan_python_files(repo_path) -> list[str]
-from core.parser import extract_code_chunks     # extract_code_chunks(file_path) -> list[str]
+from core.parser import extract_code_chunks     # extract_code_chunks(file_path) -> list[dict|str]
 from core.reviewer import review_file
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,33 @@ def _get_groq_client() -> Groq:
             "Set it in Streamlit Cloud secrets or your .env file."
         )
     return Groq(api_key=api_key)
+
+
+def _normalise_chunks(raw_chunks: list) -> list[str]:
+    """
+    Convert whatever parser.py returns into a clean list[str].
+    Handles: list[str], list[dict] with any common key name.
+    """
+    chunks: list[str] = []
+    for c in raw_chunks:
+        if isinstance(c, str):
+            chunks.append(c)
+        elif isinstance(c, dict):
+            # Try common key names parsers use for the code string
+            code = (
+                c.get("code")
+                or c.get("content")
+                or c.get("source")
+                or c.get("chunk")
+                or c.get("text")
+                or c.get("body")
+                or ""
+            )
+            chunks.append(str(code) if not isinstance(code, str) else code)
+        else:
+            chunks.append(str(c))
+
+    return [c for c in chunks if c.strip()]  # drop empty / whitespace-only
 
 
 def _flatten_file_results(
@@ -106,12 +133,12 @@ def run_pipeline(
 
     Args:
         repo_url:          GitHub repository URL.
-        min_confidence:    Drop findings below this confidence score (0–100).
+        min_confidence:    Drop findings below this confidence score (0-100).
         severity_filter:   If set, keep only findings with this severity level.
         progress_callback: Optional callable(message: str, pct: float) for UI updates.
 
     Returns:
-        PipelineResult — always populated; never silently empty.
+        PipelineResult - always populated; never silently empty.
     """
 
     def _progress(msg: str, pct: float = 0.0) -> None:
@@ -141,7 +168,7 @@ def run_pipeline(
         # ------------------------------------------------------------------
         # 2. Initialise Groq client early — fail fast if key is missing
         # ------------------------------------------------------------------
-        _progress("Initialising AI client…", 0.02)
+        _progress("Initialising AI client...", 0.02)
         try:
             client = _get_groq_client()
         except EnvironmentError as exc:
@@ -151,7 +178,7 @@ def run_pipeline(
         # ------------------------------------------------------------------
         # 3. Clone repository
         # ------------------------------------------------------------------
-        _progress(f"Cloning {repo_url}…", 0.05)
+        _progress(f"Cloning {repo_url}...", 0.05)
 
         try:
             tmp_dir = clone_repository(repo_url)   # manages its own temp dir
@@ -168,7 +195,7 @@ def run_pipeline(
         # ------------------------------------------------------------------
         # 4. Scan for Python files
         # ------------------------------------------------------------------
-        _progress("Scanning for Python files…", 0.15)
+        _progress("Scanning for Python files...", 0.15)
         try:
             python_files: list[str] = scan_python_files(tmp_dir)
         except Exception as exc:  # noqa: BLE001
@@ -180,7 +207,7 @@ def run_pipeline(
                 "No Python files found in this repository. "
                 "The repo may not contain .py files or may be empty."
             )
-            result.success = True  # Not a pipeline error — repo just has no Python
+            result.success = True
             result.stats["files_found"] = 0
             return result
 
@@ -197,11 +224,11 @@ def run_pipeline(
         for file_idx, filepath in enumerate(python_files):
             pct = 0.20 + 0.70 * (file_idx / len(python_files))
             short_path = filepath.replace(tmp_dir, "").lstrip("/\\")
-            _progress(f"Reviewing {short_path}…", pct)
+            _progress(f"Reviewing {short_path}...", pct)
 
-            # Parse
+            # --- Parse ---
             try:
-                chunks: list[str] = extract_code_chunks(filepath)
+                raw_chunks = extract_code_chunks(filepath)
             except Exception as exc:  # noqa: BLE001
                 warn = f"AST parsing failed for {short_path}: {exc}"
                 logger.warning(warn)
@@ -209,12 +236,25 @@ def run_pipeline(
                 files_with_errors += 1
                 continue
 
-            if not chunks:
+            if not raw_chunks:
                 logger.debug("No chunks extracted from %s — skipping.", short_path)
                 result.warnings.append(f"No code chunks extracted from {short_path}.")
                 continue
 
-            # Non-empty chunks — send to reviewer
+            # --- Normalise: parser may return list[str] OR list[dict] ---
+            chunks = _normalise_chunks(raw_chunks)
+            logger.info("[%s] %d raw chunks -> %d normalised string chunks.",
+                        short_path, len(raw_chunks), len(chunks))
+
+            if not chunks:
+                result.warnings.append(
+                    f"All chunks were empty after normalisation: {short_path}. "
+                    f"Parser returned type: {type(raw_chunks[0]).__name__} — "
+                    f"keys: {list(raw_chunks[0].keys()) if isinstance(raw_chunks[0], dict) else 'n/a'}"
+                )
+                continue
+
+            # --- Send to LLM reviewer ---
             try:
                 file_reviews = review_file(client, chunks, short_path)
             except Exception as exc:  # noqa: BLE001
@@ -241,7 +281,7 @@ def run_pipeline(
                 f for f in all_findings
                 if f.get("severity", "").lower() == severity_filter.lower()
             ]
-            logger.info("Severity filter '%s': %d → %d findings.",
+            logger.info("Severity filter '%s': %d -> %d findings.",
                         severity_filter, before, len(all_findings))
 
         result.stats["filtered_findings"] = len(all_findings)
@@ -261,14 +301,12 @@ def run_pipeline(
         _progress(f"Done — {result.summary_line()}", 1.0)
 
     except Exception as exc:  # noqa: BLE001
-        # Top-level safety net — should never fire, but prevents blank UI
         result.errors.append(
             f"Unexpected pipeline error: {exc}\n{traceback.format_exc()}"
         )
         logger.critical("Unhandled pipeline exception: %s", exc, exc_info=True)
 
     finally:
-        # Always clean up cloned repo
         if tmp_dir and os.path.exists(tmp_dir):
             try:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
