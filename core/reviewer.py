@@ -1,22 +1,21 @@
-import os
 import json
+import streamlit as st
 from groq import Groq
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 def review_code(code_chunk):
     prompt = f"""
 You are an expert Python code reviewer.
 
-Analyze the following code and return ONLY valid JSON.
+Return ONLY valid JSON:
 
-Required JSON format:
 {{
-    "issue": "short issue description",
+    "issue": "issue",
     "severity": "low|medium|high",
     "confidence": 0-100,
-    "suggestion": "fix recommendation",
+    "suggestion": "fix suggestion",
     "category": "security|performance|readability|reliability"
 }}
 
@@ -27,9 +26,7 @@ Code:
     try:
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=300
         )
@@ -39,18 +36,18 @@ Code:
         start = content.find("{")
         end = content.rfind("}") + 1
 
-        if start != -1 and end != -1:
+        if start != -1:
             content = content[start:end]
 
         return json.loads(content)
 
     except Exception as e:
-        print("Review error:", e)
+        print("Groq error:", e)
 
         return {
             "issue": "AI review failed",
             "severity": "low",
             "confidence": 10,
-            "suggestion": "Retry later or reduce scan size",
+            "suggestion": str(e),
             "category": "reliability"
         }
