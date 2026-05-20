@@ -130,9 +130,10 @@ if analyze_button:
     with st.spinner("Running analysis..."):
         try:
             results = run_pipeline(repo_url)
+            st.write("Debug results:", results)
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
-            st.stop()
+            st.error(f"Pipeline failed: {str(e)}")
+            results = []
 
     if not results:
         st.error("No findings generated.")
